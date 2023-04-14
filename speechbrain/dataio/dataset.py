@@ -144,7 +144,7 @@ class DynamicItemDataset(Dataset):
     """
 
     def __init__(
-        self, data, dynamic_items=[], output_keys=[],
+        self, data, dynamic_items=[], output_keys=[], n_rows = None
     ):
         self.data = data
         self.data_ids = list(self.data.keys())
@@ -155,8 +155,11 @@ class DynamicItemDataset(Dataset):
             static_keys.append("id")
         self.pipeline = DataPipeline(static_keys, dynamic_items)
         self.set_output_keys(output_keys)
+        self.n_rows = n_rows
 
     def __len__(self):
+        if self.n_rows is not None:
+            return len(self.data_ids[:self.n_rows])
         return len(self.data_ids)
 
     def __getitem__(self, index):
@@ -351,11 +354,11 @@ class DynamicItemDataset(Dataset):
 
     @classmethod
     def from_json(
-        cls, json_path, replacements={}, dynamic_items=[], output_keys=[]
+        cls, json_path, replacements={}, dynamic_items=[], output_keys=[], n_rows = None
     ):
         """Load a data prep JSON file and create a Dataset based on it."""
         data = load_data_json(json_path, replacements)
-        return cls(data, dynamic_items, output_keys)
+        return cls(data, dynamic_items, output_keys, n_rows)
 
     @classmethod
     def from_csv(

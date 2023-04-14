@@ -24,14 +24,30 @@ reverberation are automatically added to each sample from OpenRIR.
 Authors
  * Mirco Ravanelli 2021
 """
+def isLinux():
+    if sys.platform == "linux" or sys.platform == "linux2":
+        return True
+    return False
+
 import os
+from functools import reduce
 import sys
-import torch
-sys.path.append('../speechbrain') #needed for modules to be correctly imported
+# setting path
+#sys.path.append('../speechbrain')
+if isLinux():
+    sys.path.insert(0,'../../speechbrain')
+else:
+    sys.path.append('../speechbrain')
+
+from speechbrain.dataio.dataio import save_pkl
 import speechbrain as sb
+
+import torch
+
 from hyperpyyaml import load_hyperpyyaml
 from mini_librispeech_prepare import prepare_mini_librispeech
 
+import labml_nn.optimizers.noam
 
 # Brain class for speech enhancement training
 class SpkIdBrain(sb.Brain):
@@ -59,7 +75,7 @@ class SpkIdBrain(sb.Brain):
 
         # Compute features, embeddings, and predictions
         feats, lens = self.prepare_features(batch.sig, stage)
-        embeddings = self.modules.embedding_model(feats, lens)
+        embeddings = self.modules.embedding_model(feats, lens,batch.sig)
         predictions = self.modules.classifier(embeddings)
 
         return predictions
@@ -122,7 +138,11 @@ class SpkIdBrain(sb.Brain):
             lens = torch.cat([lens, lens])
 
         # Compute the cost function
-        loss = sb.nnet.losses.nll_loss(predictions, spkid, lens)
+        #spkr_onehot = torch.nn.functional.one_hot(spkid, num_classes=predictions.shape[1]).squeeze()
+        spkid = spkid.flatten()
+        loss = sb.nnet.losses.ce_loss(predictions, spkid, lens, reduction="mean")
+        #spkid = spkid.flatten() # reduce dimensionality
+        #loss = loss(predictions, spkid.flatten()) loss is calculated later in loss library
 
         # Append this batch of losses to the loss metric for easy
         self.loss_metric.append(
@@ -133,6 +153,7 @@ class SpkIdBrain(sb.Brain):
         if stage != sb.Stage.TRAIN:
             self.error_metrics.append(batch.id, predictions, spkid, lens)
 
+        predicted_id = torch.argmax(predictions, dim=1)
         return loss
 
     def on_stage_start(self, stage, epoch=None):
@@ -149,7 +170,7 @@ class SpkIdBrain(sb.Brain):
 
         # Set up statistics trackers for this stage
         self.loss_metric = sb.utils.metric_stats.MetricStats(
-            metric=sb.nnet.losses.nll_loss
+            metric=sb.nnet.losses.ce_loss
         )
 
         # Set up evaluation-only statistics trackers
@@ -184,7 +205,7 @@ class SpkIdBrain(sb.Brain):
         # At the end of validation...
         if stage == sb.Stage.VALID:
 
-            old_lr, new_lr = self.hparams.lr_annealing(epoch)
+            old_lr, new_lr = self.hparams.lr_annealing(self.optimizer)
             sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
 
             # The train_logger writes a summary to stdout and to the logfile.
@@ -255,6 +276,7 @@ def dataio_prep(hparams):
         "valid": hparams["valid_annotation"],
         "test": hparams["test_annotation"],
     }
+    n_rows = hparams["n_rows"]
     hparams["dataloader_options"]["shuffle"] = False
     for dataset in data_info:
         datasets[dataset] = sb.dataio.dataset.DynamicItemDataset.from_json(
@@ -262,6 +284,7 @@ def dataio_prep(hparams):
             replacements={"data_root": hparams["data_folder"]},
             dynamic_items=[audio_pipeline, label_pipeline],
             output_keys=["id", "sig", "spk_id_encoded"],
+            n_rows = n_rows
         )
 
     # Load or compute the label encoder (with multi-GPU DDP support)
@@ -276,20 +299,18 @@ def dataio_prep(hparams):
 
     return datasets
 
-
 # Recipe begins!
 if __name__ == "__main__":
 
-    path = 'templates/speaker_id/train.yaml'
+    # Reading command line arguments.
+    #hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
+    path = 'Transformer/speaker_id/train.yaml'
     device = 'cpu'
-    if sys.platform == "linux" or sys.platform == "linux2":
+    if isLinux():
         path = 'train.yaml'
         device = 'cuda'
     # linux
     hparams_file, run_opts, overrides = sb.parse_arguments([path, '--device', device])
-
-    # Reading command line arguments.
-    #hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
 
     # Initialize ddp (useful only for multi-GPU DDP training).
     sb.utils.distributed.ddp_init_group(run_opts)

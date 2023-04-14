@@ -1,0 +1,149 @@
+# #################################
+# Basic training parameters for speaker-id. We have first a network that
+# computes some embeddings. On the top of that, we employ a classifier.
+#
+# Author:
+#  * Mirco Ravanelli 2021
+# #################################
+
+# Seed needs to be set at top of yaml, before objects with parameters are made
+seed: 1986
+__set_seed: !!python/object/apply:torch.manual_seed [!ref <seed>]
+
+# If you plan to train a system on an HPC cluster with a big dataset,
+# we strongly suggest doing the following:
+# 1- Compress the dataset in a single tar or zip file.
+# 2- Copy your dataset locally (i.e., the local disk of the computing node).
+# 3- Uncompress the dataset in the local folder.
+# 4- Set data_folder with the local path.
+# Reading data from the local disk of the compute node (e.g. $SLURM_TMPDIR with SLURM-based clusters) is very important.
+# It allows you to read the data much faster without slowing down the shared filesystem.
+data_folder: ./data
+output_folder: !ref ./results/speaker_id/<seed>
+save_folder: !ref <output_folder>/save
+train_log: !ref <output_folder>/train_log.txt
+rir_folder: !ref <data_folder>
+
+# Path where data manifest files will be stored
+# The data manifest files are created by the data preparation script.
+train_annotation: train.json
+valid_annotation: valid.json
+test_annotation: test.json
+split_ratio: [80, 10, 10]
+n_rows:
+skip_prep: False
+
+# The train logger writes training statistics to a file, as well as stdout.
+train_logger: !new:speechbrain.utils.train_logger.FileTrainLogger
+    save_file: !ref <train_log>
+
+error_stats: !name:speechbrain.utils.metric_stats.MetricStats
+    metric: !name:speechbrain.nnet.losses.ce_loss
+        reduction: batch
+
+ckpt_interval_minutes: 15 # save checkpoint every N min
+
+# Feature parameters
+#n_mfcc: 30
+#win_length: 25
+#sample_rate: 16000
+n_mels: 30
+deltas: true
+
+
+# Training Parameters
+number_of_epochs: 5000
+batch_size: 16 #16 for now since our gpu has only 14GiB ~2GB
+lr_initial_scheduler: 10.0 
+lr_start_optim: 1.9764235376052370824993084652705e-7 #calculated a la https://nn.labml.ai/optimizers/noam.html
+#1.97e-05  looks promising with learning cross entropy, but with noam schedulers he goes over greater lr which results in
+n_warmup_steps: 25000.0
+d_model: 128 #hidden dimensionality
+gradient_clip: 5
+
+dataloader_options:
+    batch_size: !ref <batch_size>
+
+
+# Added noise and reverb come from OpenRIR dataset, automatically
+# downloaded and prepared with this Environmental Corruption class.
+#env_corrupt: !new:speechbrain.lobes.augment.EnvCorrupt
+#    openrir_folder: !ref <rir_folder>
+#    babble_prob: 0.0
+#    reverb_prob: 0.0
+#    noise_prob: 1.0
+#    noise_snr_low: 0
+#    noise_snr_high: 15
+
+# Adds speech change + time and frequency dropouts (time-domain implementation)
+# # A small speed change help to improve the performance of speaker-id as well.
+#augmentation: !new:speechbrain.lobes.augment.TimeDomainSpecAugment
+#    sample_rate: !ref <sample_rate>
+#    speeds: [95, 100, 105]
+
+# Feature extraction
+compute_features: !new:speechbrain.lobes.features.Fbank # in the paper MFCC are used
+    n_mels: !ref <n_mels>
+
+# Mean and std normalization of the input features
+mean_var_norm: !new:speechbrain.processing.features.InputNormalization
+    norm_type: mean
+    std_norm: False
+
+# To design a custom model, either just edit the simple CustomModel
+# class that's listed here, or replace this `!new` call with a line
+# pointing to a different file you've defined.
+
+embedding_model: !new:custom_model.SVector
+    d_input: !ref <n_mels>      
+    d_model: !ref <d_model> 
+    n_layers: 6
+    n_head: 8
+    d_output_FFNN: [!ref <d_model>, 1500, 512, 512]
+    dropout: 0.1
+    n_speakers: 28
+
+classifier: !new:custom_model.Classifier
+    d_output_FFNN: [!ref <d_model>, 1500, 512, 512]
+    n_speakers: 28
+
+# The first object passed to the Brain class is this "Epoch Counter"
+# which is saved by the Checkpointer so that training can be resumed
+# if it gets interrupted at any point.
+epoch_counter: !new:speechbrain.utils.epoch_loop.EpochCounter
+    limit: !ref <number_of_epochs>
+
+# Objects in "modules" dict will have their parameters moved to the correct
+# device, as well as having train()/eval() called on them by the Brain class.
+modules:
+    compute_features: !ref <compute_features>
+    #env_corrupt: !ref <env_corrupt>
+    #augmentation: !ref <augmentation>
+    embedding_model: !ref <embedding_model>
+    classifier: !ref <classifier>
+    mean_var_norm: !ref <mean_var_norm>
+
+# This optimizer will be constructed by the Brain class after all parameters1
+# are moved to the correct device. Then it will be added to the checkpointer.
+opt_class: !name:torch.optim.Adam
+    lr: !ref <lr_start_optim>
+
+# This function manages learning rate annealing over the epochs. v 
+# We here use the simple lr annealing method that linearly decreases
+# the lr from the initial value to the final one.
+lr_annealing: !new:speechbrain.nnet.schedulers.NoamScheduler
+    lr_initial: !ref <lr_initial_scheduler>
+    n_warmup_steps: !ref <n_warmup_steps>
+    model_size: !ref <d_model>  #hidden dimension of the transformer
+
+
+# This object is used for saving the state of training both so that it
+# can be resumed if it gets interrupted, and also so that the best checkpoint
+# can be later loaded for evaluation or inference.
+checkpointer: !new:speechbrain.utils.checkpoints.Checkpointer
+    checkpoints_dir: !ref <save_folder>
+    recoverables:
+        embedding_model: !ref <embedding_model>
+        classifier: !ref <classifier>
+        normalizer: !ref <mean_var_norm>
+        counter: !ref <epoch_counter>

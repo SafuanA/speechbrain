@@ -506,7 +506,8 @@ class Brain:
                     setattr(self, arg, hparams[arg])
                 else:
                     setattr(self, arg, default)
-
+        if 'gradient_clip' in hparams:
+            self.gradient_clip = hparams['gradient_clip']
         # Check Python version
         if not (
             sys.version_info.major == PYTHON_VERSION_MAJOR
@@ -736,12 +737,6 @@ class Brain:
         # TRAIN stage is handled specially.
         if stage == sb.Stage.TRAIN:
             loader_kwargs = self._train_loader_specifics(dataset, loader_kwargs)
-        # This commented-out code block is useful when one can ensure
-        # metric reporting is DDP-valid for VALID & EVAL datasets.
-        # elif self.distributed_launch:
-        #     loader_kwargs = sb.dataio.dataloader.distributed_loader_specifics(
-        #         self.distributed_launch, self.rank, dataset, loader_kwargs
-        #     )
         dataloader = sb.dataio.dataloader.make_dataloader(
             dataset, **loader_kwargs
         )
@@ -959,6 +954,11 @@ class Brain:
             if should_step:
                 if self.check_gradients(loss):
                     self.optimizer.step()
+                if self.gradient_clip is not None:
+                    model = self.modules.embedding_model
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), self.gradient_clip)
+                else:
+                    self.zero_grad()
                 self.zero_grad()
                 self.optimizer_step += 1
 

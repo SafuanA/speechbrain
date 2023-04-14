@@ -521,6 +521,146 @@ def bce_loss(
         reduction=reduction,
     )
 
+def ce_loss(
+    inputs,
+    targets,
+    length=None,
+    weight=None,
+    pos_weight=None,
+    reduction="none",
+    allowed_len_diff=3,
+    label_smoothing=0.0,
+):
+    """Computes cross-entropy (BCE) loss.
+
+    Arguments
+    ---------
+    inputs : torch.Tensor
+        The output before applying the final softmax
+        Format is [batch[, 1]?] or [batch, frames[, 1]?].
+        (Works with or without a singleton dimension at the end).
+    targets : torch.Tensor
+        The targets, of shape [batch] or [batch, frames].
+    length : torch.Tensor
+        Length of each utterance, if frame-level loss is desired.
+    weight : torch.Tensor
+        A manual rescaling weight if provided it’s repeated to match input
+        tensor shape.
+    pos_weight : torch.Tensor
+        A weight of positive examples. Must be a vector with length equal to
+        the number of classes.
+    allowed_len_diff : int
+        Length difference that will be tolerated before raising an exception.
+    reduction: str
+        Options are 'mean', 'batch', 'batchmean', 'sum'.
+        See pytorch for 'mean', 'sum'. The 'batch' option returns
+        one loss per item in the batch, 'batchmean' returns sum / batch size.
+
+    Example
+    -------
+    >>> inputs = torch.tensor([10.0, -6.0])
+    >>> targets = torch.tensor([1, 0])
+    >>> bce_loss(inputs, targets)
+    tensor(0.0013)
+    """
+    # Squeeze singleton dimension so inputs + targets match
+    if len(inputs.shape) == len(targets.shape) + 1:
+        inputs = inputs.squeeze(-1)
+
+    #Make sure tensor lengths match
+    #if loss is type(ce_loss):
+    #    uwu = 1 #do nothing
+    #if len(inputs.shape) >= 2:
+    #    inputs, targets = truncate(inputs, targets, allowed_len_diff)
+    #elif length is not None:
+    #    raise ValueError("length can be passed only for >= 2D inputs.")
+
+    # Pass the loss function but apply reduction="none" first
+    loss = functools.partial(
+        torch.nn.functional.cross_entropy,
+        weight=weight,
+        reduction="none"
+    )
+    #loss = loss(inputs, targets)
+    #if reduction == "mean":
+    #    loss = loss.sum() / torch.sum(mask)
+    #elif reduction == "batchmean":
+    #    loss = loss.sum() / N
+    #elif reduction == "batch":
+    #    loss = loss.reshape(N, -1).sum(1) / mask.reshape(N, -1).sum(1)
+    #return loss
+    return compute_masked_ce_loss(
+        loss,
+        inputs,
+        targets.float(),
+        length,
+        label_smoothing=label_smoothing,
+        reduction=reduction,
+    )
+def compute_masked_ce_loss(
+    loss_fn,
+    predictions,
+    targets,
+    length=None,
+    label_smoothing=0.0,
+    reduction="mean",
+):
+    """Compute the true average loss of a set of waveforms of unequal length.
+
+    Arguments
+    ---------
+    loss_fn : function
+        A function for computing the loss taking just predictions and targets.
+        Should return all the losses, not a reduction (e.g. reduction="none").
+    predictions : torch.Tensor
+        First argument to loss function.
+    targets : torch.Tensor
+        Second argument to loss function.
+    length : torch.Tensor
+        Length of each utterance to compute mask. If None, global average is
+        computed and returned.
+    label_smoothing: float
+        The proportion of label smoothing. Should only be used for NLL loss.
+        Ref: Regularizing Neural Networks by Penalizing Confident Output
+        Distributions. https://arxiv.org/abs/1701.06548
+    reduction : str
+        One of 'mean', 'batch', 'batchmean', 'none' where 'mean' returns a
+        single value and 'batch' returns one per item in the batch and
+        'batchmean' is sum / batch_size and 'none' returns all.
+    """
+    mask = torch.ones_like(targets).int()
+    #if length is not None:
+    #    #ce only implemented for the 1d case
+    #    length_mask = targets.shape[0]
+
+    #    # Handle any dimensionality of input
+    #    while len(length_mask.shape) < len(mask.shape):
+    #        length_mask = length_mask.unsqueeze(-1)
+    #    length_mask = length_mask.type(mask.dtype)
+    #    mask *= length_mask
+
+    # Compute, then reduce loss
+    loss = loss_fn(predictions, targets.long()) * mask
+    N = loss.size(0)
+    if reduction == "mean":
+        loss = loss.sum() / torch.sum(mask)
+    elif reduction == "batchmean":
+        loss = loss.sum() / N
+    elif reduction == "batch":
+        loss = loss.reshape(N, -1).sum(1) / mask.reshape(N, -1).sum(1)
+
+    if label_smoothing == 0:
+        return loss
+    else:
+        loss_reg = torch.mean(predictions, dim=1) * mask
+        if reduction == "mean":
+            loss_reg = torch.sum(loss_reg) / torch.sum(mask)
+        elif reduction == "batchmean":
+            loss_reg = torch.sum(loss_reg) / targets.shape[0]
+        elif reduction == "batch":
+            loss_reg = loss_reg.sum(1) / mask.sum(1)
+
+        return -label_smoothing * loss_reg + (1 - label_smoothing) * loss
 
 def kldiv_loss(
     log_probabilities,

@@ -1,16 +1,8 @@
-#!/usr/bin/env python3
-"""Recipe for training a speaker-id system. The template can use used as a
-basic example for any signal classification task such as language_id,
-emotion recognition, command classification, etc. The proposed task classifies
-28 speakers using Mini Librispeech. This task is very easy. In a real
-scenario, you need to use datasets with a larger number of speakers such as
-the voxceleb one (see recipes/VoxCeleb). Speechbrain has already some built-in
-models for signal classifications (see the ECAPA one in
-speechbrain.lobes.models.ECAPA_TDNN.py or the xvector in
-speechbrain/lobes/models/Xvector.py)
+#!/usr/bin/env/python3
+"""Recipe for training a speech enhancement system with spectral masking.
 
 To run this recipe, do the following:
-> python train.py train.yaml
+> python train.py train.yaml --data_folder /path/to/save/mini_librispeech
 
 To read the code, first scroll to the bottom to see the "main" code.
 This gives a high-level overview of what is going on, while the
@@ -22,24 +14,23 @@ and prepare the Mini Librispeech dataset for computation. Noise and
 reverberation are automatically added to each sample from OpenRIR.
 
 Authors
- * Mirco Ravanelli 2021
+ * Szu-Wei Fu 2020
+ * Chien-Feng Liao 2020
+ * Peter Plantinga 2021
 """
-import os
 import sys
 import torch
-sys.path.append('../speechbrain') #needed for modules to be correctly imported
 import speechbrain as sb
 from hyperpyyaml import load_hyperpyyaml
 from mini_librispeech_prepare import prepare_mini_librispeech
 
 
 # Brain class for speech enhancement training
-class SpkIdBrain(sb.Brain):
+class SEBrain(sb.Brain):
     """Class that manages the training loop. See speechbrain.core.Brain."""
 
     def compute_forward(self, batch, stage):
-        """Runs all the computation of that transforms the input into the
-        output probabilities over the N classes.
+        """Apply masking to convert from noisy waveforms to enhanced signals.
 
         Arguments
         ---------
@@ -50,58 +41,55 @@ class SpkIdBrain(sb.Brain):
 
         Returns
         -------
-        predictions : Tensor
-            Tensor that contains the posterior probabilities over the N classes.
+        predictions : dict
+            A dictionary with keys {"spec", "wav"} with predicted features.
         """
 
-        # We first move the batch to the appropriate device.
+        # We first move the batch to the appropriate device, and
+        # compute the features necessary for masking.
         batch = batch.to(self.device)
+        noisy_wavs, lens = batch.noisy_sig
+        noisy_feats = self.compute_feats(noisy_wavs)
 
-        # Compute features, embeddings, and predictions
-        feats, lens = self.prepare_features(batch.sig, stage)
-        embeddings = self.modules.embedding_model(feats, lens)
-        predictions = self.modules.classifier(embeddings)
+        # Masking is done here with the "signal approximation (SA)" algorithm.
+        # The masked input is compared directly with clean speech targets.
+        mask = self.modules.model(noisy_feats)
+        predict_spec = torch.mul(mask, noisy_feats)
 
-        return predictions
+        # Also return predicted wav, for evaluation. Note that this could
+        # also be used for a time-domain loss term.
+        predict_wav = self.hparams.resynth(
+            torch.expm1(predict_spec), noisy_wavs
+        )
 
-    def prepare_features(self, wavs, stage):
-        """Prepare the features for computation, including augmentation.
+        # Return a dictionary so we don't have to remember the order
+        return {"spec": predict_spec, "wav": predict_wav}
+
+    def compute_feats(self, wavs):
+        """Returns corresponding log-spectral features of the input waveforms.
 
         Arguments
         ---------
-        wavs : tuple
-            Input signals (tensor) and their relative lengths (tensor).
-        stage : sb.Stage
-            The current stage of training.
+        wavs : torch.Tensor
+            The batch of waveforms to convert to log-spectral features.
         """
-        wavs, lens = wavs
 
-        # Add augmentation if specified. In this version of augmentation, we
-        # concatenate the original and the augment batches in a single bigger
-        # batch. This is more memory-demanding, but helps to improve the
-        # performance. Change it if you run OOM.
-        if stage == sb.Stage.TRAIN:
-            if hasattr(self.modules, "env_corrupt"):
-                wavs_noise = self.modules.env_corrupt(wavs, lens)
-                wavs = torch.cat([wavs, wavs_noise], dim=0)
-                lens = torch.cat([lens, lens])
+        # Log-spectral features
+        feats = self.hparams.compute_STFT(wavs)
+        feats = sb.processing.features.spectral_magnitude(feats, power=0.5)
 
-            if hasattr(self.hparams, "augmentation"):
-                wavs = self.hparams.augmentation(wavs, lens)
+        # Log1p reduces the emphasis on small differences
+        feats = torch.log1p(feats)
 
-        # Feature extraction and normalization
-        feats = self.modules.compute_features(wavs)
-        feats = self.modules.mean_var_norm(feats, lens)
-
-        return feats, lens
+        return feats
 
     def compute_objectives(self, predictions, batch, stage):
         """Computes the loss given the predicted and targeted outputs.
 
         Arguments
         ---------
-        predictions : tensor
-            The output tensor from `compute_forward`.
+        predictions : dict
+            The output dict from `compute_forward`.
         batch : PaddedBatch
             This batch object contains all the relevant tensors for computation.
         stage : sb.Stage
@@ -113,25 +101,30 @@ class SpkIdBrain(sb.Brain):
             A one-element tensor used for backpropagating the gradient.
         """
 
-        _, lens = batch.sig
-        spkid, _ = batch.spk_id_encoded
+        # Prepare clean targets for comparison
+        clean_wavs, lens = batch.clean_sig
+        clean_spec = self.compute_feats(clean_wavs)
 
-        # Concatenate labels (due to data augmentation)
-        if stage == sb.Stage.TRAIN and hasattr(self.modules, "env_corrupt"):
-            spkid = torch.cat([spkid, spkid], dim=0)
-            lens = torch.cat([lens, lens])
-
-        # Compute the cost function
-        loss = sb.nnet.losses.nll_loss(predictions, spkid, lens)
+        # Directly compare the masked spectrograms with the clean targets
+        loss = sb.nnet.losses.mse_loss(predictions["spec"], clean_spec, lens)
 
         # Append this batch of losses to the loss metric for easy
         self.loss_metric.append(
-            batch.id, predictions, spkid, lens, reduction="batch"
+            batch.id, predictions["spec"], clean_spec, lens, reduction="batch"
         )
 
-        # Compute classification error at test time
+        # Some evaluations are slower, and we only want to perform them
+        # on the validation set.
         if stage != sb.Stage.TRAIN:
-            self.error_metrics.append(batch.id, predictions, spkid, lens)
+
+            # Evaluate speech intelligibility as an additional metric
+            self.stoi_metric.append(
+                batch.id,
+                predictions["wav"],
+                clean_wavs,
+                lens,
+                reduction="batch",
+            )
 
         return loss
 
@@ -149,12 +142,14 @@ class SpkIdBrain(sb.Brain):
 
         # Set up statistics trackers for this stage
         self.loss_metric = sb.utils.metric_stats.MetricStats(
-            metric=sb.nnet.losses.nll_loss
+            metric=sb.nnet.losses.mse_loss
         )
 
         # Set up evaluation-only statistics trackers
         if stage != sb.Stage.TRAIN:
-            self.error_metrics = self.hparams.error_stats()
+            self.stoi_metric = sb.utils.metric_stats.MetricStats(
+                metric=sb.nnet.loss.stoi_loss.stoi_loss
+            )
 
     def on_stage_end(self, stage, stage_loss, epoch=None):
         """Gets called at the end of an epoch.
@@ -178,24 +173,21 @@ class SpkIdBrain(sb.Brain):
         else:
             stats = {
                 "loss": stage_loss,
-                "error": self.error_metrics.summarize("average"),
+                "stoi": -self.stoi_metric.summarize("average"),
             }
 
-        # At the end of validation...
+        # At the end of validation, we can write stats and checkpoints
         if stage == sb.Stage.VALID:
-
-            old_lr, new_lr = self.hparams.lr_annealing(epoch)
-            sb.nnet.schedulers.update_learning_rate(self.optimizer, new_lr)
-
             # The train_logger writes a summary to stdout and to the logfile.
             self.hparams.train_logger.log_stats(
-                {"Epoch": epoch, "lr": old_lr},
+                {"Epoch": epoch},
                 train_stats={"loss": self.train_loss},
                 valid_stats=stats,
             )
 
             # Save the current checkpoint and delete previous checkpoints,
-            self.checkpointer.save_and_keep_only(meta=stats, min_keys=["error"])
+            # unless they have the current best STOI score.
+            self.checkpointer.save_and_keep_only(meta=stats, max_keys=["stoi"])
 
         # We also write statistics about test data to stdout and to the logfile.
         if stage == sb.Stage.TEST:
@@ -208,9 +200,9 @@ class SpkIdBrain(sb.Brain):
 def dataio_prep(hparams):
     """This function prepares the datasets to be used in the brain class.
     It also defines the data processing pipeline through user-defined functions.
+
     We expect `prepare_mini_librispeech` to have been called before this,
-    so that the `train.json`, `valid.json`,  and `valid.json` manifest files
-    are available.
+    so that the `train.json` and `valid.json` manifest files are available.
 
     Arguments
     ---------
@@ -225,30 +217,20 @@ def dataio_prep(hparams):
         to the appropriate DynamicItemDataset object.
     """
 
-    # Initialization of the label encoder. The label encoder assigns to each
-    # of the observed label a unique index (e.g, 'spk01': 0, 'spk02': 1, ..)
-    label_encoder = sb.dataio.encoder.CategoricalEncoder()
-
-    # Define audio pipeline
+    # Define audio pipeline. Adds noise, reverb, and babble on-the-fly.
+    # Of course for a real enhancement dataset, you'd want a fixed valid set.
     @sb.utils.data_pipeline.takes("wav")
-    @sb.utils.data_pipeline.provides("sig")
+    @sb.utils.data_pipeline.provides("noisy_sig", "clean_sig")
     def audio_pipeline(wav):
         """Load the signal, and pass it and its length to the corruption class.
         This is done on the CPU in the `collate_fn`."""
-        sig = sb.dataio.dataio.read_audio(wav)
-        return sig
+        clean_sig = sb.dataio.dataio.read_audio(wav)
+        noisy_sig = hparams["env_corruption"](
+            clean_sig.unsqueeze(0), torch.ones(1)
+        ).squeeze(0)
+        return noisy_sig, clean_sig
 
-    # Define label pipeline:
-    @sb.utils.data_pipeline.takes("spk_id")
-    @sb.utils.data_pipeline.provides("spk_id", "spk_id_encoded")
-    def label_pipeline(spk_id):
-        """Defines the pipeline to process the input speaker label."""
-        yield spk_id
-        spk_id_encoded = label_encoder.encode_label_torch(spk_id)
-        yield spk_id_encoded
-
-    # Define datasets. We also connect the dataset with the data processing
-    # functions defined above.
+    # Define datasets sorted by ascending lengths for efficiency
     datasets = {}
     data_info = {
         "train": hparams["train_annotation"],
@@ -260,41 +242,22 @@ def dataio_prep(hparams):
         datasets[dataset] = sb.dataio.dataset.DynamicItemDataset.from_json(
             json_path=data_info[dataset],
             replacements={"data_root": hparams["data_folder"]},
-            dynamic_items=[audio_pipeline, label_pipeline],
-            output_keys=["id", "sig", "spk_id_encoded"],
-        )
-
-    # Load or compute the label encoder (with multi-GPU DDP support)
-    # Please, take a look into the lab_enc_file to see the label to index
-    # mapping.
-    lab_enc_file = os.path.join(hparams["save_folder"], "label_encoder.txt")
-    label_encoder.load_or_create(
-        path=lab_enc_file,
-        from_didatasets=[datasets["train"]],
-        output_key="spk_id",
-    )
-
+            dynamic_items=[audio_pipeline],
+            output_keys=["id", "noisy_sig", "clean_sig"],
+        ).filtered_sorted(sort_key="length")
     return datasets
 
 
 # Recipe begins!
 if __name__ == "__main__":
 
-    path = 'templates/speaker_id/train.yaml'
-    device = 'cpu'
-    if sys.platform == "linux" or sys.platform == "linux2":
-        path = 'train.yaml'
-        device = 'cuda'
-    # linux
-    hparams_file, run_opts, overrides = sb.parse_arguments([path, '--device', device])
+    # Reading command line arguments
+    hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
 
-    # Reading command line arguments.
-    #hparams_file, run_opts, overrides = sb.parse_arguments(sys.argv[1:])
-
-    # Initialize ddp (useful only for multi-GPU DDP training).
+    # Initialize ddp (useful only for multi-GPU DDP training)
     sb.utils.distributed.ddp_init_group(run_opts)
 
-    # Load hyperparameters file with command-line overrides.
+    # Load hyperparameters file with command-line overrides
     with open(hparams_file) as fin:
         hparams = load_hyperpyyaml(fin, overrides)
 
@@ -314,15 +277,14 @@ if __name__ == "__main__":
                 "save_json_train": hparams["train_annotation"],
                 "save_json_valid": hparams["valid_annotation"],
                 "save_json_test": hparams["test_annotation"],
-                "split_ratio": hparams["split_ratio"],
             },
         )
 
-    # Create dataset objects "train", "valid", and "test".
+    # Create dataset objects "train" and "valid"
     datasets = dataio_prep(hparams)
 
     # Initialize the Brain object to prepare for mask training.
-    spk_id_brain = SpkIdBrain(
+    se_brain = SEBrain(
         modules=hparams["modules"],
         opt_class=hparams["opt_class"],
         hparams=hparams,
@@ -334,17 +296,17 @@ if __name__ == "__main__":
     # necessary to update the parameters of the model. Since all objects
     # with changing state are managed by the Checkpointer, training can be
     # stopped at any point, and will be resumed on next call.
-    spk_id_brain.fit(
-        epoch_counter=spk_id_brain.hparams.epoch_counter,
+    se_brain.fit(
+        epoch_counter=se_brain.hparams.epoch_counter,
         train_set=datasets["train"],
         valid_set=datasets["valid"],
         train_loader_kwargs=hparams["dataloader_options"],
         valid_loader_kwargs=hparams["dataloader_options"],
     )
 
-    # Load the best checkpoint for evaluation
-    test_stats = spk_id_brain.evaluate(
+    # Load best checkpoint (highest STOI) for evaluation
+    test_stats = se_brain.evaluate(
         test_set=datasets["test"],
-        min_key="error",
+        max_key="stoi",
         test_loader_kwargs=hparams["dataloader_options"],
     )

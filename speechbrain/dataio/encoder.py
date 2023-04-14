@@ -147,6 +147,8 @@ class CategoricalEncoder:
         """Handles special labels such as unk_label."""
         if "unk_label" in special_labels:
             self.add_unk(special_labels["unk_label"])
+        if "lab_encoder_file" in special_labels:
+            self.load_or_create(special_labels["lab_encoder_file"])
 
     def __len__(self):
         return len(self.lab2ind)

@@ -405,6 +405,8 @@ class NoamScheduler:
         self.normalize = n_warmup_steps ** 0.5
         if model_size is not None:
             self.normalize = model_size ** (-0.5)
+        #we add 1 since the scheduler starts with an initial learnign rate which we calculate
+        self.n_steps += 1.0
 
     def __call__(self, opt):
         """
@@ -420,7 +422,7 @@ class NoamScheduler:
         lr : float
             The learning rate after the update.
         """
-        self.n_steps += 1
+        self.n_steps += 1.0
 
         current_lr = opt.param_groups[0]["lr"]
 
